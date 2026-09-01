@@ -11,13 +11,15 @@ Design rules enforced here:
 """
 from __future__ import annotations
 
+from types import UnionType
+
 import json
 import logging
 import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, Union, get_args, get_origin
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -197,22 +199,61 @@ def _strip_code_fence(text: str) -> str:
 
 
 def _fill_from_evidence(model: type[BaseModel], evidence: dict[str, Any]) -> dict[str, Any]:
-    """Build a schema-valid payload out of the supplied evidence only."""
+    """Build a schema-valid payload out of the supplied evidence only.
+
+    Types are resolved by introspection rather than by matching the annotation
+    as a string. String matching silently produced invalid payloads for any
+    field that was a dict, a nested model, a list of models, or a Literal --
+    the provider then reported a validation error and the caller saw "the AI
+    layer is unavailable" when the real problem was here.
+    """
     payload: dict[str, Any] = {}
     for name, field_info in model.model_fields.items():
         if name in evidence:
             payload[name] = evidence[name]
             continue
-        annotation = str(field_info.annotation).lower()
-        if "list" in annotation:
-            payload[name] = _offline_bullets(name)
-        elif "float" in annotation or "int" in annotation:
-            payload[name] = 0
-        elif "bool" in annotation:
-            payload[name] = False
-        else:
-            payload[name] = _offline_sentence(name, evidence)
+        payload[name] = _placeholder(field_info.annotation, name, evidence)
     return payload
+
+
+def _placeholder(annotation: Any, name: str, evidence: dict[str, Any]) -> Any:
+    """A schema-valid stand-in value for one field."""
+    origin = get_origin(annotation)
+
+    # Optional[X] / X | None: fill the first non-None member.
+    if origin is Union or origin is UnionType:
+        args = [a for a in get_args(annotation) if a is not type(None)]
+        return _placeholder(args[0], name, evidence) if args else None
+
+    if origin is Literal:
+        options = get_args(annotation)
+        return options[0] if options else _offline_sentence(name, evidence)
+
+    if origin in (list, set, tuple):
+        args = get_args(annotation)
+        inner = args[0] if args else str
+        if isinstance(inner, type) and issubclass(inner, BaseModel):
+            return [_fill_from_evidence(inner, evidence)]
+        if inner is str:
+            return _offline_bullets(name)
+        return []
+
+    if origin is dict:
+        return {}
+
+    if isinstance(annotation, type):
+        if issubclass(annotation, BaseModel):
+            return _fill_from_evidence(annotation, evidence)
+        if annotation is bool:
+            return False
+        if annotation in (int, float):
+            return 0
+        if annotation is dict:
+            return {}
+        if annotation is list:
+            return []
+
+    return _offline_sentence(name, evidence)
 
 
 def _offline_sentence(field_name: str, evidence: dict[str, Any]) -> str:
